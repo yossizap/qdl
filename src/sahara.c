@@ -97,6 +97,8 @@ typedef struct {
 #define SAHARA_DONE_LENGTH		0x8
 #define SAHARA_DONE_RESP_LENGTH		0xc
 #define SAHARA_RESET_LENGTH		0x8
+#define SAHARA_EXECUTE_LENGTH		0xc
+#define SAHARA_EXECUTE_RESP_LENGTH	0x10
 
 #define DEBUG_BLOCK_SIZE (512u * 1024u)
 
@@ -136,6 +138,13 @@ struct sahara_pkt {
 			uint32_t status;
 		} done_resp;
 		struct {
+			uint32_t client_cmd;
+		} execute_req;
+		struct {
+			uint32_t client_cmd;
+			uint32_t data_length;
+		} execute_resp;
+		struct {
 			uint64_t addr;
 			uint64_t length;
 		} debug64_req;
@@ -146,6 +155,69 @@ struct sahara_pkt {
 		} read64_req;
 	};
 };
+
+#define SIERRA_SAHARA_CLIENT_CMD	0xff00
+#define SIERRA_SAHARA_CONFIRMATION	"confirmed"
+
+static int sahara_send_hello_resp(struct qdl_device *qdl, unsigned int mode);
+
+/*
+ * Sierra's download loader is a standard Sahara command-mode client.  It
+ * transitions to its resident Firehose implementation after a vendor command
+ * 0xff00 and the literal confirmation payload captured from slqssdk.
+ */
+int sahara_sierra_enter_firehose(struct qdl_device *qdl)
+{
+	struct sahara_pkt pkt;
+	struct sahara_pkt resp = {};
+	const char confirmation[] = SIERRA_SAHARA_CONFIRMATION;
+	int n;
+
+	n = qdl_read(qdl, &pkt, sizeof(pkt), SAHARA_CMD_TIMEOUT_MS);
+	if (n != SAHARA_HELLO_LENGTH || pkt.cmd != SAHARA_HELLO_CMD ||
+	    pkt.length != SAHARA_HELLO_LENGTH) {
+		ux_err("expected Sierra Sahara HELLO, got %d-byte command 0x%x\n",
+		       n, pkt.cmd);
+		return -EINVAL;
+	}
+
+	/* Request Sahara command mode, rather than the target's memory-debug mode. */
+	if (sahara_send_hello_resp(qdl, SAHARA_MODE_COMMAND) < 0)
+		return -EIO;
+
+	n = qdl_read(qdl, &pkt, sizeof(pkt), SAHARA_CMD_TIMEOUT_MS);
+	if (n != 8 || pkt.cmd != SAHARA_CMD_READY_CMD || pkt.length != 8) {
+		ux_err("expected Sierra Sahara CMD_READY\n");
+		return -EINVAL;
+	}
+
+	resp.cmd = SAHARA_EXECUTE_CMD;
+	resp.length = SAHARA_EXECUTE_LENGTH;
+	resp.execute_req.client_cmd = SIERRA_SAHARA_CLIENT_CMD;
+	if (qdl_write(qdl, &resp, resp.length, SAHARA_CMD_TIMEOUT_MS) !=
+	    (int)resp.length)
+		return -EIO;
+
+	n = qdl_read(qdl, &pkt, sizeof(pkt), SAHARA_CMD_TIMEOUT_MS);
+	if (n != SAHARA_EXECUTE_RESP_LENGTH || pkt.cmd != SAHARA_EXECUTE_RESP_CMD ||
+	    pkt.length != SAHARA_EXECUTE_RESP_LENGTH ||
+	    pkt.execute_resp.client_cmd != SIERRA_SAHARA_CLIENT_CMD ||
+	    pkt.execute_resp.data_length != sizeof(confirmation) - 1) {
+		ux_err("unexpected Sierra Sahara EXECUTE response\n");
+		return -EINVAL;
+	}
+
+	resp.cmd = SAHARA_EXECUTE_DATA_CMD;
+	resp.length = SAHARA_EXECUTE_LENGTH;
+	resp.execute_req.client_cmd = SIERRA_SAHARA_CLIENT_CMD;
+	if (qdl_write(qdl, &resp, resp.length, SAHARA_CMD_TIMEOUT_MS) !=
+	    (int)resp.length ||
+	    qdl_write(qdl, confirmation, sizeof(confirmation) - 1,
+		      SAHARA_CMD_TIMEOUT_MS) != (int)(sizeof(confirmation) - 1))
+		return -EIO;
+
+	return 0;
+}
 
 struct sahara_debug_region64 {
 	uint64_t type;

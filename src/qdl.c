@@ -1299,6 +1299,56 @@ out_cleanup:
 	return !!ret;
 }
 
+static int qdl_sierra_cwe(int argc, char **argv)
+{
+	char *serial = NULL;
+	struct qdl_device *qdl;
+	bool reset_when_done = false;
+	bool opened = false;
+	int opt;
+	int ret;
+
+	static struct option options[] = {
+		{"serial", required_argument, 0, 'S'},
+		{"reset", no_argument, 0, 'r'},
+		{"debug", no_argument, 0, 'd'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	optind = 1;
+	while ((opt = getopt_long(argc, argv, "S:rdh", options, NULL)) != -1) {
+		switch (opt) {
+		case 'S': serial = optarg; break;
+		case 'r': reset_when_done = true; break;
+		case 'd': qdl_debug = true; break;
+		default:
+			fprintf(stderr, "usage: qdl sierra-cwe [-d] [-r] [-S serial] spkg.cwe\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+	if (optind + 1 != argc) {
+		fprintf(stderr, "usage: qdl sierra-cwe [-d] [-r] [-S serial] spkg.cwe\n");
+		return 1;
+	}
+
+	ux_init();
+	qdl = qdl_init(QDL_DEVICE_USB);
+	if (!qdl)
+		return 1;
+	qdl->sierra_cwe = true;
+	ret = qdl_open(qdl, serial);
+	opened = !ret;
+	if (!ret)
+		ret = sahara_sierra_enter_firehose(qdl);
+	if (!ret)
+		ret = firehose_sierra_cwe(qdl, argv[optind], reset_when_done);
+	if (opened)
+		qdl_close(qdl);
+	qdl_deinit(qdl);
+	return ret ? 1 : 0;
+}
+
 int main(int argc, char **argv)
 {
 	int i;
@@ -1310,6 +1360,8 @@ int main(int argc, char **argv)
 			return qdl_ramdump(argc - i, argv + i);
 		if (!strcmp(argv[i], "ks"))
 			return qdl_ks(argc - i, argv + i);
+		if (!strcmp(argv[i], "sierra-cwe"))
+			return qdl_sierra_cwe(argc - i, argv + i);
 		if (!strcmp(argv[i], "create-zip"))
 			return qdl_create_zip(argc - i, argv + i);
 		if (argv[i][0] != '-')

@@ -45,6 +45,11 @@ enum {
  */
 #define VIP_PROGRAMMER_MARKER "VIP is enabled, receiving the signed table"
 
+static int firehose_detect_and_configure(struct qdl_device *qdl,
+					 bool skip_storage_init,
+					 enum qdl_storage_type storage,
+					 unsigned int timeout_s);
+
 static void firehose_check_vip_marker(struct qdl_device *qdl, xmlNode *node)
 {
 	xmlChar *value;
@@ -1571,6 +1576,125 @@ static int firehose_reset(struct qdl_device *qdl)
 		firehose_read(qdl, 1000, firehose_generic_parser, NULL);
 
 	return ret == FIREHOSE_ACK ? 0 : -1;
+}
+
+static int firehose_sierra_get_storage_info(struct qdl_device *qdl)
+{
+	xmlNode *root;
+	xmlNode *node;
+	xmlDoc *doc;
+	int ret;
+
+	doc = xmlNewDoc((xmlChar *)"1.0");
+	root = xmlNewNode(NULL, (xmlChar *)"data");
+	xmlDocSetRootElement(doc, root);
+	node = xmlNewChild(root, NULL, (xmlChar *)"getStorageInfo", NULL);
+	xml_setpropf(node, "physical_partition_number", "0");
+
+	ret = firehose_write(qdl, doc);
+	xmlFreeDoc(doc);
+	if (ret < 0)
+		return ret;
+
+	return firehose_read(qdl, 10000, firehose_generic_parser, NULL) == FIREHOSE_ACK ? 0 : -EIO;
+}
+
+/*
+ * Send a Sierra CWE container to the resident NAND Firehose implementation.
+ * This is deliberately separate from generic rawprogram handling: Sierra
+ * consumes a whole CWE stream at start_sector=-1 and requires a 512-byte ZLP
+ * replacement terminator after the unpadded file bytes.
+ */
+int firehose_sierra_cwe(struct qdl_device *qdl, const char *filename,
+			bool reset_when_done)
+{
+	struct stat st;
+	xmlNode *root;
+	xmlNode *node;
+	xmlDoc *doc;
+	char buf[16384];
+	char terminator[512] = {};
+	unsigned int sectors;
+	off_t left;
+	int fd;
+	int ret;
+	ssize_t n;
+
+	fd = open(filename, O_RDONLY);
+	if (fd < 0) {
+		ux_err("unable to open CWE file %s\n", filename);
+		return -errno;
+	}
+	if (fstat(fd, &st) < 0 || st.st_size <= 0) {
+		ret = -errno;
+		if (!ret)
+			ret = -EINVAL;
+		goto out_close;
+	}
+
+	/* These are reported by the captured WP7607 Firehose storage response. */
+	qdl->sector_size = 4096;
+	ret = firehose_sierra_get_storage_info(qdl);
+	if (ret < 0) {
+		ux_err("Sierra Firehose getStorageInfo failed\n");
+		goto out_close;
+	}
+
+	ret = firehose_detect_and_configure(qdl, false, QDL_STORAGE_NAND, 5);
+	if (ret < 0)
+		goto out_close;
+
+	sectors = (st.st_size + qdl->sector_size - 1) / qdl->sector_size;
+	doc = xmlNewDoc((xmlChar *)"1.0");
+	root = xmlNewNode(NULL, (xmlChar *)"data");
+	xmlDocSetRootElement(doc, root);
+	node = xmlNewChild(root, NULL, (xmlChar *)"program", NULL);
+	xml_setpropf(node, "PAGES_PER_BLOCK", "64");
+	xml_setpropf(node, "SECTOR_SIZE_IN_BYTES", "%zu", qdl->sector_size);
+	xml_setpropf(node, "num_partition_sectors", "%u", sectors);
+	xml_setpropf(node, "filename", "spkg.cwe");
+	xml_setpropf(node, "physical_partition_number", "0");
+	xml_setpropf(node, "start_sector", "-1");
+
+	ret = firehose_write(qdl, doc);
+	xmlFreeDoc(doc);
+	if (ret < 0 || firehose_read(qdl, 10000, firehose_generic_parser, NULL) != FIREHOSE_ACK) {
+		ux_err("Sierra Firehose rejected CWE program request\n");
+		ret = -EIO;
+		goto out_close;
+	}
+
+	left = st.st_size;
+	while (left) {
+		n = read(fd, buf, MIN(sizeof(buf), (size_t)left));
+		if (n <= 0) {
+			ret = n < 0 ? -errno : -EIO;
+			goto out_close;
+		}
+		if (qdl_write(qdl, buf, n, 120000) != n) {
+			ret = -EIO;
+			goto out_close;
+		}
+		left -= n;
+	}
+
+	if (qdl_write(qdl, terminator, sizeof(terminator), 120000) != sizeof(terminator)) {
+		ret = -EIO;
+		goto out_close;
+	}
+	ret = firehose_read(qdl, 120000, firehose_generic_parser, NULL);
+	if (ret != FIREHOSE_ACK) {
+		ux_err("Sierra Firehose did not confirm CWE processing\n");
+		ret = -EIO;
+		goto out_close;
+	}
+
+	ux_info("processed Sierra CWE %s successfully\n", filename);
+	ret = reset_when_done ? firehose_reset(qdl) : 0;
+
+out_close:
+	close(fd);
+	return ret;
 }
 
 static int firehose_detect_and_configure(struct qdl_device *qdl,

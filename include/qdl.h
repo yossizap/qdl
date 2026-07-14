@@ -74,6 +74,8 @@ enum qdl_skipblock_mode {
 
 struct qdl_device {
 	enum QDL_DEVICE_TYPE dev_type;
+	/* Sierra WP76 download mode shares the runtime VID:PID; opt in explicitly. */
+	bool sierra_cwe;
 	int fd;
 	size_t max_payload_size;
 	size_t sector_size;
@@ -172,6 +174,9 @@ int firehose_read_buf(struct qdl_device *qdl, struct firehose_op *read_op, void 
 int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 	       const char *ramdump_path,
 	       const char *ramdump_filter);
+int sahara_sierra_enter_firehose(struct qdl_device *qdl);
+int firehose_sierra_cwe(struct qdl_device *qdl, const char *filename,
+			bool reset_when_done);
 int load_sahara_image(struct qdl_zip *zip, const char *filename, struct sahara_image *image);
 void sahara_images_free(struct sahara_image *images, size_t count);
 void print_hex_dump(const char *prefix, const void *buf, size_t len);

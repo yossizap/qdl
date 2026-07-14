@@ -31,6 +31,12 @@ static bool usb_is_edl_pid(uint16_t pid)
 	return pid == 0x9008 || pid == 0x900e || pid == 0x901d || pid == 0x90db;
 }
 
+static bool usb_is_sierra_download(const struct libusb_device_descriptor *desc)
+{
+	return desc->idVendor == 0x1199 && desc->idProduct == 0x68c0 &&
+	       desc->bcdDevice == 0;
+}
+
 /*
  * libusb commit f0cce43f882d ("core: Fix definition and use of enum
  * libusb_transfer_type") split transfer type and endpoint transfer types.
@@ -43,7 +49,8 @@ static bool usb_is_edl_pid(uint16_t pid)
 
 static bool usb_read_serial(struct libusb_device_handle *handle,
 			    const struct libusb_device_descriptor *desc,
-			    char *out, size_t out_len)
+			    char *out, size_t out_len,
+			    bool descriptor_serial)
 {
 	char buf[128];
 	char *p;
@@ -56,6 +63,14 @@ static bool usb_read_serial(struct libusb_device_handle *handle,
 	}
 
 	p = strstr(buf, "_SN:");
+	if (!p && descriptor_serial) {
+		ret = libusb_get_string_descriptor_ascii(handle, desc->iSerialNumber,
+						(unsigned char *)buf, sizeof(buf));
+		if (ret < 0)
+			return false;
+		snprintf(out, out_len, "%.*s", (int)out_len - 1, buf);
+		return true;
+	}
 	if (!p)
 		return false;
 
@@ -67,7 +82,8 @@ static bool usb_read_serial(struct libusb_device_handle *handle,
 }
 
 static bool usb_match_usb_serial(struct libusb_device_handle *handle, const char *serial,
-				 const struct libusb_device_descriptor *desc)
+				 const struct libusb_device_descriptor *desc,
+				 bool descriptor_serial)
 {
 	char buf[64];
 
@@ -75,7 +91,7 @@ static bool usb_match_usb_serial(struct libusb_device_handle *handle, const char
 	if (!serial)
 		return true;
 
-	if (!usb_read_serial(handle, desc, buf, sizeof(buf)))
+	if (!usb_read_serial(handle, desc, buf, sizeof(buf), descriptor_serial))
 		return false;
 
 	return strcmp(buf, serial) == 0;
@@ -103,10 +119,9 @@ static int usb_try_open(libusb_device *dev, struct qdl_device_usb *qdl, const ch
 		return -1;
 	}
 
-	/* Consider only devices with vid 0x0506 and known product id */
-	if (desc.idVendor != 0x05c6)
-		return 0;
-	if (!usb_is_edl_pid(desc.idProduct))
+	/* Sierra's runtime has the same VID:PID as download mode: require bcdDevice 0. */
+	if (qdl->base.sierra_cwe ? !usb_is_sierra_download(&desc) :
+	    desc.idVendor != 0x05c6 || !usb_is_edl_pid(desc.idProduct))
 		return 0;
 
 	ret = libusb_get_active_config_descriptor(dev, &config);
@@ -157,7 +172,8 @@ static int usb_try_open(libusb_device *dev, struct qdl_device_usb *qdl, const ch
 			continue;
 		}
 
-		if (!usb_match_usb_serial(handle, serial, &desc)) {
+		if (!usb_match_usb_serial(handle, serial, &desc,
+					  qdl->base.sierra_cwe)) {
 			libusb_close(handle);
 			continue;
 		}
@@ -256,7 +272,8 @@ int try_usb_open(struct qdl_device *qdl, const char *serial, int *visible_out)
 
 		if (libusb_get_device_descriptor(dev, &desc) < 0)
 			continue;
-		if (desc.idVendor != 0x05c6 || !usb_is_edl_pid(desc.idProduct))
+		if (qdl->sierra_cwe ? !usb_is_sierra_download(&desc) :
+		    desc.idVendor != 0x05c6 || !usb_is_edl_pid(desc.idProduct))
 			continue;
 
 		visible++;
@@ -266,7 +283,8 @@ int try_usb_open(struct qdl_device *qdl, const char *serial, int *visible_out)
 			found = true;
 			matched_pid = desc.idProduct;
 			if (!usb_read_serial(qdl_usb->usb_handle, &desc,
-					     matched_serial, sizeof(matched_serial)))
+					     matched_serial, sizeof(matched_serial),
+					     qdl->sierra_cwe))
 				matched_serial[0] = '\0';
 			break;
 		}

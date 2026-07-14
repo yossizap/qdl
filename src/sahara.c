@@ -171,9 +171,18 @@ int sahara_sierra_enter_firehose(struct qdl_device *qdl)
 	struct sahara_pkt pkt;
 	struct sahara_pkt resp = {};
 	const char confirmation[] = SIERRA_SAHARA_CONFIRMATION;
+	char buf[sizeof(confirmation) - 1];
 	int n;
 
 	n = qdl_read(qdl, &pkt, sizeof(pkt), SAHARA_CMD_TIMEOUT_MS);
+	/*
+	 * A previous interrupted session can leave the final command-mode
+	 * confirmation queued. It means the resident Firehose is already ready.
+	 */
+	if (n == (int)sizeof(buf) && !memcmp(&pkt, confirmation, sizeof(buf))) {
+		ux_info("Sierra Sahara confirmation already received\n");
+		return 0;
+	}
 	if (n != SAHARA_HELLO_LENGTH || pkt.cmd != SAHARA_HELLO_CMD ||
 	    pkt.length != SAHARA_HELLO_LENGTH) {
 		ux_err("expected Sierra Sahara HELLO, got %d-byte command 0x%x\n",
@@ -211,10 +220,14 @@ int sahara_sierra_enter_firehose(struct qdl_device *qdl)
 	resp.length = SAHARA_EXECUTE_LENGTH;
 	resp.execute_req.client_cmd = SIERRA_SAHARA_CLIENT_CMD;
 	if (qdl_write(qdl, &resp, resp.length, SAHARA_CMD_TIMEOUT_MS) !=
-	    (int)resp.length ||
-	    qdl_write(qdl, confirmation, sizeof(confirmation) - 1,
-		      SAHARA_CMD_TIMEOUT_MS) != (int)(sizeof(confirmation) - 1))
+	    (int)resp.length)
 		return -EIO;
+
+	n = qdl_read(qdl, buf, sizeof(buf), SAHARA_CMD_TIMEOUT_MS);
+	if (n != (int)sizeof(buf) || memcmp(buf, confirmation, sizeof(buf))) {
+		ux_err("unexpected Sierra Sahara confirmation\n");
+		return -EINVAL;
+	}
 
 	return 0;
 }
